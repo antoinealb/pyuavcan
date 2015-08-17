@@ -35,8 +35,9 @@ class Type:
     '''
     CATEGORY_PRIMITIVE = 0
     CATEGORY_ARRAY = 1
-    CATEGORY_COMPOUND = 2
-    CATEGORY_VOID = 3
+    CATEGORY_MATRIX = 2
+    CATEGORY_COMPOUND = 3
+    CATEGORY_VOID = 4
 
     def __init__(self, full_name, category):
         self.full_name = str(full_name)
@@ -131,6 +132,36 @@ class ArrayType(Type):
             self.MODE_DYNAMIC: payload_max_bitlen + self.max_size.bit_length(),
             self.MODE_STATIC: payload_max_bitlen
         }[self.mode]
+
+    def get_data_type_signature(self):
+        return self.value_type.get_data_type_signature()
+
+
+class MatrixType(Type):
+    '''
+    Matrix type description, e.g. float32[3,3].
+    Fields:
+        value_type    Description of the matrix value type; the type of this field inherits Type, e.g. PrimitiveType
+        sparse        True if sparse, False if not
+        num_rows      Number of rows
+        num_columns   Number of columns
+    '''
+    def __init__(self, value_type, sparse, num_rows, num_columns):
+        self.value_type = value_type
+        self.sparse = sparse
+        self.num_rows = num_rows
+        self.num_columns = num_columns
+        Type.__init__(self, self.get_normalized_definition(), Type.CATEGORY_MATRIX)
+
+    def get_normalized_definition(self):
+        '''Please refer to the specification for details about normalized definitions.'''
+        typedef = self.value_type.get_normalized_definition()
+        return '%s[%s%d,%d]' % (typedef, ('<=' if self.sparse else ''), self.num_rows, self.num_columns)
+
+    def get_max_bitlen(self):
+        '''Returns total maximum bit length of the matrix, including length field if applicable.'''
+        max_items = self.num_rows * self.num_columns
+        return max_items * self.value_type.get_max_bitlen() + max_items.bit_length()
 
     def get_data_type_signature(self):
         return self.value_type.get_data_type_signature()
@@ -395,6 +426,23 @@ class Parser:
         enforce(1 <= bitlen <= 64, 'Invalid void bit length [%d]', bitlen)
         return VoidType(bitlen)
 
+    def _parse_matrix_type(self, filename, value_typedef, size_spec, cast_mode):
+        self.log.debug('Parsing the matrix value type [%s]...', value_typedef)
+        value_type = self._parse_type(filename, value_typedef, cast_mode)
+        enforce(value_type.category != value_type.CATEGORY_ARRAY,
+                 'Multidimensional arrays are not allowed (protip: use nested types)')
+        try:
+            if size_spec.startswith('<='):
+                sparse = True
+                size_spec = size_spec[2:]
+            else:
+                sparse = False
+            rows, cols = map(int, size_spec.split(','))
+        except ValueError:
+            error('Invalid matrix dimension specifier [%s] (valid patterns: [X,Y], [<=X,Y])', size_spec)
+        enforce(rows > 0 and cols > 0, 'Matrix dimensions must be positive, not [%d,%d]', rows, cols)
+        return MatrixType(value_type, sparse, rows, cols)
+
     def _parse_array_type(self, filename, value_typedef, size_spec, cast_mode):
         self.log.debug('Parsing the array value type [%s]...', value_typedef)
         value_type = self._parse_type(filename, value_typedef, cast_mode)
@@ -451,12 +499,17 @@ class Parser:
     def _parse_type(self, filename, typedef, cast_mode):
         typedef = typedef.strip()
         void_match = re.match(r'void(\d{1,2})$', typedef)
-        array_match = re.match(r'(.+?)\[([^\]]*)\]$', typedef)
+        matrix_match = re.match(r'(.+?)\[([<=]*\d+, *\d+)\]$', typedef)
+        array_match = re.match(r'(.+?)\[([\d=<]*)\]$', typedef)
         primitive_match = re.match(r'([a-z]+)(\d{1,2})$|(bool)$', typedef)
 
         if void_match:
             size_spec = void_match.group(1).strip()
             return self._parse_void_type(filename, int(size_spec))
+        elif matrix_match:
+            value_typedef = matrix_match.group(1).strip()
+            size_spec = matrix_match.group(2).strip()
+            return self._parse_matrix_type(filename, value_typedef, size_spec, cast_mode)
         elif array_match:
             assert not primitive_match
             value_typedef = array_match.group(1).strip()
